@@ -33,12 +33,9 @@ panda = Panda("x86_64", mem="1G",qcow="/home/luke/.panda/bionic-server-cloudimg-
 
 panda.set_os_name("linux-64-ubuntu:4.15.0-72-generic-noaslr-nokaslr")
 
-connected_count = 0
 
 class Process(object):
     def __init__(self, proc_object):
-        self.taskd = proc_object.taskd
-        self.asid = proc_object.asid
         self.pid = proc_object.pid
         self.ppid = proc_object.ppid
         self.start_time = proc_object.create_time
@@ -46,28 +43,47 @@ class Process(object):
             self.name = ffi.string(proc_object.name).decode()
         except:
             self.name = "?"
-        self.pages = proc_object.pages
         self.children = set()
         self.parent = None
-        self.tmp_parent_pid = None
-
-    def set_parent(self, parent):
-        self.parent = parent
+    
+    @property
+    def depth(self):
+        if hasattr(self, "_depth"):
+            return self._depth
+        if self.parent is self or not self.parent:
+            return 1
+        else:
+            self._depth = 1 + self.parent.depth
+            return self._depth
 
     def add_child(self, other):
-        if other != self:
+        if not other is self:
             self.children.add(other)
-        else:
-            print(f"{self.name} is the same as {other.name}")
-    
+
+    def is_kernel_task(self):
+        if "kthreadd" in self.name:
+            return True
+        if self.parent and not self.parent is self:
+            return self.parent.is_kernel_task()
+        return False
+
     def __hash__(self):
-        return hash((self.taskd, self.asid, self.pid, self.ppid, self.name, self.pages, self.start_time))
+        return hash((self.pid, self.ppid, self.name, self.start_time))
+    
+    def __lt__(self, other):
+        return self.depth < other.depth
 
     def __eq__(self, other):
         if not isinstance(other, Process):
             return False
-        return self.taskd == other.taskd and self.asid == other.asid and self.pid == other.pid and self.ppid == other.ppid and self.name == other.name and self.pages == other.pages and self.start_time == other.start_time
+        if not self.is_kernel_task():
+            return self.start_time == other.start_time
+        return self.pid == other.pid
 
+    def __str__(self):
+        return f"{self.name}_{hex(self.start_time)[2:]}".replace(":","")
+
+# map PID to process
 processes = set()
 time_stop = 1000
 
@@ -89,38 +105,7 @@ def get_pid_object(pid):
     return best
 
 nodes_to_add = {} 
-'''
-So we want to resolve not a PID number, but an object. For that reaon we want
-to wait and resolve it once the object is in our processes set. Otherwise we
-keep things in the "tmp_parent_pid" variable. This lets us know that we don't
-have a proper parent and need to work on that.
-'''
-def try_resolve_parent(proc_obj):
-    global nodes_to_add
-    parent_pid = proc_obj.ppid
-    parent = get_pid_object(parent_pid)
-    if parent and not proc_obj.parent:
-        proc_obj.set_parent(parent)
-        parent.add_child(proc_obj)
-        proc_obj.tmp_parent_pid = None
-        print(f"new pair {parent.name} {proc_obj.name}")
-        for nodes in nodes_to_add:
-            nodes_to_add[nodes].append({'pproc':f"{parent.name}_{hex(parent.start_time)[2:]}", 'child':f"{proc_obj.name}_{hex(proc_obj.start_time)[2:]}"})
-        if not nodes_to_add:
-            print("no nodes_to_add")
-#            socketio.emit('my response',{'pproc':parent.name,'child': proc_obj.name}, callback=messageReceived, broadcast=True)
-        #nodes_to_add.append({'pproc':parent.name,'child': proc_obj.name})
-    else:
-        proc_obj.tmp_parent_pid = parent_pid
-
-
-def is_kernel_sub(proc):
-    if "kthreadd" in proc.name:
-        return True
-    parent = proc.parent
-    if parent and not proc == parent:
-        return is_kernel_sub(parent)
-    return False
+nodes_to_remove = {}
 
 '''
 On asid change we iterate over the entire process list. If unseen it could be
@@ -134,36 +119,38 @@ and rematch them with try_resolve_parent.
 We also use this as a convenient place to end the recording at a certain amount
 of time.
 '''
+
 @panda.cb_asid_changed
 def asid_changed(env, old_asid, new_asid):
+    global processes
+    new_processes = set()
+    pid_mapping = {}
+
     for process in panda.get_processes(env):
         proc_obj = Process(process)
-        if proc_obj not in processes:
-            # is this a name change?
-            # assumption: same start time -> same task -> switch them out
-            same_obj = None
-            for p_compare in processes:
-                if p_compare.start_time == proc_obj.start_time:
-                    if not is_kernel_sub(proc_obj) and not is_kernel_sub(p_compare):
-                        same_obj = p_compare
-                        break
-            if same_obj:
-                print(f"{same_obj.name} is the same as {proc_obj.name}")
-#                import ipdb
-#                ipdb.set_trace()
-                processes.remove(same_obj)
-                if same_obj.parent:
-                    same_obj.parent.children.remove(same_obj)
-            # new process
-            processes.add(proc_obj)
-            try_resolve_parent(proc_obj)
+        new_processes.add(proc_obj)
+        pid_mapping[proc_obj.pid] = proc_obj
+    
+    processes_to_consider = list(new_processes)
+    processes_to_consider.sort(key=lambda x: x.pid)
+    for process in processes_to_consider:
+        parent = pid_mapping[process.ppid]
+        process.parent = parent
+        parent.add_child(process)
+    
+    proc_new = set(processes_to_consider)
 
-    # if the parent process isn't in our list before we get there
-    # then we go through and add it here
-    for process in processes:
-        if process.tmp_parent_pid:
-            print(f"secondary resolve for {process.name}")
-            try_resolve_parent(process)
+    new_processes = proc_new - processes
+    dead_processes = processes - proc_new
+
+    processes = proc_new
+
+    for nodes in nodes_to_add:
+        for node in new_processes:
+            nodes_to_add[nodes].add(node)
+    for nodes in nodes_to_remove:
+        for node in dead_processes:
+            nodes_to_remove[nodes].add(node)
 
     if datetime.now() - time_start > timedelta(seconds=time_stop):
         panda.end_analysis()
@@ -173,28 +160,29 @@ def asid_changed(env, old_asid, new_asid):
 @blocking
 def run_cmd():
     panda.revert_sync("root")
-    print(panda.run_serial_cmd("uname -a"))
-    print(panda.run_serial_cmd("ls -la"))
-    print(panda.run_serial_cmd("whoami"))
-    print(panda.run_serial_cmd("date"))
-    print(panda.run_serial_cmd("sleep 10"))
-    print(panda.run_serial_cmd("uname -a | cat | cat | cat | cat | tee /asdf"))
-    print(panda.run_serial_cmd("watch watch watch watch watch watch date"))
+    while True:
+        print(panda.run_serial_cmd("uname -a"))
+        print(panda.run_serial_cmd("ls -la"))
+        print(panda.run_serial_cmd("whoami"))
+        print(panda.run_serial_cmd("date"))
+        print(panda.run_serial_cmd("uname -a | cat | cat | cat | cat | tee /asdf"))
+        print(panda.run_serial_cmd("time time time time time whoami"))
+        print(panda.run_serial_cmd("sleep 10"))
+#        print(panda.run_serial_cmd("watch watch watch watch watch watch date &"))
 	
 
 @app.route("/")
 def graph():
     g = Graph('unix', filename='process',engine='dot')
-#                node_attr={'color':'lightblue2',  'arrowhead': 'vee'})
     def traverse_internal(node):
+        if node is None:
+            return
         for child in node.children:
-            g.edge(f"{node.name}_{hex(node.start_time)[2:]}".replace(":",""), f"{child.name}_{hex(child.start_time)[2:]}".replace(":",""))
+            g.edge(str(node),str(child))
             traverse_internal(child)
     init = get_pid_object(0)
+   
     traverse_internal(init)
-#    g.render(format='png', filename='process.png',view=False)
-#    chart_output = g.pipe(format='png')
-#    chart_output = base64.b64encode(chart_output).decode('utf-8')
     return render_template('svgtest.html', chart_output=g.source)
 
 
@@ -217,17 +205,34 @@ def emitEvents():
         return result_str
     #infinite loop of magical random numbers
     my_string = get_random_string(8)
-    nodes_to_add[my_string] = []
+    nodes_to_add[my_string] = set()
+    nodes_to_remove[my_string] = set()
     my_nodes_to_add = nodes_to_add[my_string]
+    my_nodes_to_remove = nodes_to_remove[my_string]
     print(f"Making random numbers {my_string}")
     while not thread_stop_event.isSet():
+        common = list(set(my_nodes_to_add).intersection(set(my_nodes_to_remove)))
+        for i in common:
+            my_nodes_to_add.remove(i)
+            my_nodes_to_remove.remove(i)
+        # sort nodes to add by depth
+        nodes_to_add_sorted = list(my_nodes_to_add)
+        sorted(nodes_to_add_sorted, key=lambda x: x.depth)
         if my_nodes_to_add:
-            p = my_nodes_to_add.pop(0)
+            p = nodes_to_add_sorted[0]
+            my_nodes_to_add.remove(p)
             print(f"emitting newprocess {p}")
-            socketio.emit('newprocess', p, namespace='/test')
-        else:
-            print(f"No nodes to add {len(my_nodes_to_add)}")
-        socketio.sleep(1)
+            parent = p.parent
+            socketio.emit('newprocess', {'operation': 'add', 'pproc': str(parent), 'child': str(p)}, namespace='/test')
+        nodes_to_remove_sorted = list(my_nodes_to_remove)
+        sorted(nodes_to_remove_sorted, key=lambda x: -x.depth)
+        if my_nodes_to_remove:
+            p = nodes_to_remove_sorted[0]
+            my_nodes_to_remove.remove(p)
+            print(f"emitting remove {p}")
+            parent = p.parent
+            socketio.emit('newprocess', {'operation': 'remove', 'pproc': str(parent), 'child': str(p)}, namespace='/test')
+        socketio.sleep(0.1)
 
 @socketio.on('connect', namespace='/test')
 def test_connect():
@@ -252,23 +257,4 @@ x.start()
 
 panda.queue_async(run_cmd)
 panda.run()
-
-
-g = Graph('unix', filename='process',engine='dot',
-            node_attr={'color':'lightblue2', 'style':'filled', 'arrowhead': 'vee'})
-
-def traverse(node, parentstr):
-    if parentstr:
-        parentstr += f"-> {node.name}_{hex(node.start_time)[2:]} "
-    else:
-        parentstr = f"{node.name}_{hex(node.start_time)[2:]} "
-    print(parentstr)
-    for child in node.children:
-        g.edge(f"{node.name}_{hex(node.start_time)[2:]}".replace(":",""), f"{child.name}_{hex(child.start_time)[2:]}".replace(":",""))
-        traverse(child, parentstr)
-
-print("PROCESS LIST")
-init = get_pid_object(0)
-traverse(init,"")
-g.render(format='png', filename='process.png',view=False)
-x.join()
+thread_stop_event.set()
