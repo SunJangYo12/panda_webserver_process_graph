@@ -24,7 +24,7 @@ app.config['DEBUG'] = True
 #turn the flask app into a socketio app
 socketio = SocketIO(app, async_mode=None, logger=True, engineio_logger=True, debug=False, use_reloader=False)
 
-panda = Panda("x86_64", mem="1G",qcow="/home/luke/.panda/bionic-server-cloudimg-amd64-noaslr-nokaslr.qcow2",
+panda = Panda("x86_64", mem="1G",qcow="bionic-server-cloudimg-amd64-noaslr-nokaslr.qcow2",
             expect_prompt=rb"root@ubuntu:.*",
             extra_args=["-nographic",                           
             "-net", "nic,netdev=net0",
@@ -161,6 +161,7 @@ def asid_changed(env, old_asid, new_asid):
 def run_cmd():
     panda.revert_sync("root")
     while True:
+        print(panda.run_serial_cmd("sleep 10"))
         print(panda.run_serial_cmd("uname -a"))
         print(panda.run_serial_cmd("ls -la"))
         print(panda.run_serial_cmd("whoami"))
@@ -168,7 +169,7 @@ def run_cmd():
         print(panda.run_serial_cmd("uname -a | cat | cat | cat | cat | tee /asdf"))
         print(panda.run_serial_cmd("time time time time time whoami"))
         print(panda.run_serial_cmd("sleep 10"))
-#        print(panda.run_serial_cmd("watch watch watch watch watch watch date &"))
+        print(panda.run_serial_cmd("watch watch watch watch watch watch date &"))
 	
 
 @app.route("/")
