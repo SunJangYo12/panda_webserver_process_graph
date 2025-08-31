@@ -1,0 +1,9 @@
+
+target="/root/GIT/mydocker/bak/bionic-server-cloudimg-amd64-noaslr-nokaslr.qcow2"
+
+panda-system-x86_64 \
+    -m 1G \
+    -hda $target \
+    -nographic \
+    -monitor telnet:127.0.0.1:4444,server,nowait
+

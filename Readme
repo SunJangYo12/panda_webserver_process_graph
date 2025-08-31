@@ -1,0 +1,19 @@
+# make snapshot in qcow images
+$ bash run-bionic
+$ ./busybox telnet localhost 4444 #in container with busybox copy
+(qemu) info snapshot
+(qemu) savevm myroot
+(qemu) quit
+
+# tes with:
+$ python run_cmd.py
+$ python run.py
+
+# depends:
+pandare-1.8.58
+
+
+# lihat perkembangan kode:
+$ mkdir x; mv git.tar x; cd x
+$ tar xf git.tar
+$ git log
